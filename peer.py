@@ -16,6 +16,20 @@ class Peer:
         self.tracker_port = 8000
         self.files = {}  # hash -> file_path
         self.downloading = {}  # hash -> {pieces: dict, total_pieces: int}
+        self.connect_to_tracker()
+    
+    
+    def connect_to_tracker(self):
+        """Conecta ao tracker e lista torrents disponíveis"""
+        response = self.send_tracker_request({'action': 'list_torrents'})
+        if response and response.get('status') == 'success':
+            print("\nTorrents disponíveis no tracker:")
+            for torrent in response['torrents']:
+                print(f"  {torrent['name']} ({torrent['size']} bytes)")
+                print(f"  Hash: {torrent['hash']}")
+                print(f"  Peers: {torrent['peers']}\n")
+        else:
+            print("Não foi possível obter a lista de torrents")
         
     def start(self):
         """Inicia o servidor do peer para aceitar conexões de outros peers"""
@@ -51,27 +65,40 @@ class Peer:
             client.close()
     
     def add_file(self, file_path):
-        """Adiciona um arquivo para compartilhamento"""
+        """Adiciona arquivo e se torna seeder"""
         if not os.path.exists(file_path):
             print(f"Arquivo {file_path} não encontrado")
             return None
         
-        # Calcula hash do arquivo
         with open(file_path, 'rb') as f:
             content = f.read()
             file_hash = hashlib.sha1(content).hexdigest()
-        
+    
         self.files[file_hash] = file_path
-        
-        # Registra torrent no tracker
+    
         file_info = {
             'name': os.path.basename(file_path),
             'size': len(content),
             'pieces': self.split_into_pieces(content)
         }
-        
+    
         self.register_torrent(file_hash, file_info)
+    
+        self.announce_as_seeder(file_hash)
         return file_hash
+    
+    
+    def announce_as_seeder(self, torrent_hash):
+        """Anuncia como seeder para o tracker"""
+        request = {
+            'action': 'announce',
+            'peer_id': self.peer_id,
+            'torrent_hash': torrent_hash,
+            'host': self.host,
+            'port': self.port,
+            'is_seeder': True  # Indica que tem o arquivo completo
+        }
+        return self.send_tracker_request(request)
     
     def split_into_pieces(self, content, piece_size=1024):
         """Divide arquivo em pedaços"""
@@ -96,7 +123,20 @@ class Peer:
         self.send_tracker_request(request)
     
     def announce_to_tracker(self, torrent_hash):
-        """Anuncia presença no tracker"""
+        """Anuncia presença no tracker e atualiza"""
+        response = self._send_announce(torrent_hash)
+        
+        
+        if not response or not isinstance(response, dict):
+            print("Resposta inválida do tracker")
+            return None
+        
+        if response and response.get('status') == 'success':
+            # Agenda próximo anúncio (a cada 15 minutos)
+            threading.Timer(900, self.announce_to_tracker, [torrent_hash]).start()
+        return response
+    
+    def _send_announce(self, torrent_hash):
         request = {
             'action': 'announce',
             'peer_id': self.peer_id,
@@ -107,12 +147,21 @@ class Peer:
         return self.send_tracker_request(request)
     
     def send_tracker_request(self, request):
-        """Envia requisição para o tracker"""
         try:
+            print(f"Conectando ao tracker em {self.tracker_host}:{self.tracker_port}")  # Log 1
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)  # Timeout de 5 segundos
             sock.connect((self.tracker_host, self.tracker_port))
+            print(f"Enviando requisição: {request}")  # Log 2
             sock.send(json.dumps(request).encode('utf-8'))
-            response = json.loads(sock.recv(4096).decode('utf-8'))
+            
+            response_data = sock.recv(4096).decode('utf-8')
+            try:
+                response = json.loads(response_data)  # Converte string JSON para dict
+            except json.JSONDecodeError:
+                print(f"Resposta inválida do tracker: {response_data}")
+                return None
+            
             sock.close()
             return response
         except Exception as e:
@@ -120,22 +169,30 @@ class Peer:
             return None
     
     def download_file(self, torrent_hash, save_path):
-        """Baixa arquivo usando torrent hash"""
+        """Baixa arquivo e só se anuncia como peer se conseguir completar"""
         print(f"Iniciando download do torrent {torrent_hash}")
-        
-        # Anuncia para o tracker
-        response = self.announce_to_tracker(torrent_hash)
-        if not response or response.get('status') != 'success':
-            print("Erro ao anunciar para tracker")
+    
+        # Primeiro verifica se há seeders disponíveis
+        response = self.send_tracker_request({
+            'action': 'get_peers',
+            'torrent_hash': torrent_hash
+        })
+    
+        if not response or not response.get('peers'):
+            print("Nenhum seeder disponível para este torrent")
             return False
-        
-        peers = response.get('peers', [])
-        if not peers:
-            print("Nenhum peer disponível")
-            return False
-        
-        # Baixa de peers
-        success = self.download_from_peers(torrent_hash, peers, save_path)
+    
+        # Tenta baixar o arquivo
+        success = self.download_from_peers(torrent_hash, response['peers'], save_path)
+    
+        # Só anuncia como peer se o download for bem-sucedido
+        if success:
+            self.files[torrent_hash] = save_path
+            self.announce_as_seeder(torrent_hash)
+            print("✓ Download concluído e agora você é um seeder!")
+        else:
+            print("✗ Download falhou")
+    
         return success
     
     def download_from_peers(self, torrent_hash, peers, save_path):
@@ -212,6 +269,9 @@ class Peer:
     def send_piece(self, request):
         """Envia pedaço de arquivo para outro peer"""
         torrent_hash = request['torrent_hash']
+        if torrent_hash not in self.files:
+            return {'status': 'error', 'message': 'Arquivo não encontrado'}
+        
         piece_index = request['piece_index']
         
         if torrent_hash not in self.files:
@@ -256,3 +316,62 @@ class Peer:
                 return {'status': 'success', 'file_info': file_info}
         except Exception as e:
             return {'status': 'error', 'message': str(e)}
+            
+    def interactive_menu(self):
+        """Menu interativo para o peer"""
+        print("\n=== MENU DO PEER ===")
+        print("Comandos disponíveis:")
+        print("  refresh - Atualizar lista de torrents")
+        print("  share <arquivo> - Compartilhar arquivo")
+        print("  download <hash> <destino> - Baixar arquivo")
+        print("  exit - Sair")
+    
+        while True:
+            cmd = input(f"\nPeer {self.peer_id}> ").strip().lower()
+            parts = cmd.split()
+        
+            if not parts:
+                continue
+                
+            if parts[0] == "refresh":
+                self.connect_to_tracker()
+
+            elif parts[0] == "share" and len(parts) == 2:
+                file_path = parts[1]
+                if not os.path.exists(file_path):
+                    print(f"Erro: Arquivo '{file_path}' não encontrado.")
+                    continue
+                torrent_hash = self.add_file(file_path)
+                if torrent_hash:
+                    print(f"Arquivo compartilhado com hash: {torrent_hash}")
+        
+            elif parts[0] == "download" and len(parts) == 3:
+                torrent_hash, save_path = parts[1], parts[2]
+                print(f"Iniciando download do torrent {torrent_hash}...")
+                success = self.download_file(torrent_hash, save_path)
+                print("Download concluído com sucesso!" if success else "Falha no download.")
+        
+            elif parts[0] == "list":
+                print("\nArquivos compartilhados:")
+                for torrent_hash, file_path in self.files.items():
+                    print(f"  - {file_path} (Hash: {torrent_hash})")
+        
+            elif parts[0] == "exit":
+                print("Encerrando peer...")
+                os._exit(0)
+        
+            else:
+                print("Comando inválido. Use:")
+                print("  share <caminho_arquivo>")
+                print("  download <hash> <saida>")
+                print("  list")
+                print("  refresh")
+                print("  exit")
+            
+if __name__ == "__main__":
+    peer_id = input("Digite um ID para este peer: ").strip() or f"peer_{random.randint(1000, 9999)}"
+    port = int(input("Digite a porta para este peer (ex: 9001): ") or random.randint(9000, 9999))
+    
+    peer = Peer(peer_id=peer_id, port=port)
+    threading.Thread(target=peer.interactive_menu, daemon=True).start()
+    peer.start()  # Inicia o servidor
